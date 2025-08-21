@@ -1,0 +1,2 @@
+# Reemplaza cualquier valor de GROQ_API_KEY en docker-compose y .env por PLACEHOLDER
+regex:(?i)(GROQ_API_KEY\s*[:=]\s*)(["']?)[A-Za-z0-9_\-\.]+(\2) ==> $1$2REDACTED$3
