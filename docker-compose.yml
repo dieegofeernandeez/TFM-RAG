@@ -1,12 +1,12 @@
 version: '3.8'
 
 services:
-  # Servicio API Backend con OpenAI
+  # Servicio API Backend con Groq
   api-backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: openai-api
+    container_name: groq-api
     ports:
       - "8000:8000"
     environment:
@@ -36,6 +36,83 @@ services:
     restart: unless-stopped
     networks:
       - chat-network
+
+  # Servicio etcd para Milvus
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.12
+    container_name: milvus-etcd
+    command: [
+      "/usr/local/bin/etcd",
+      "--name", "milvus-etcd",
+      "--data-dir", "/etcd-data",
+      "--listen-client-urls", "http://0.0.0.0:2379",
+      "--advertise-client-urls", "http://milvus-etcd:2379",
+      "--listen-peer-urls", "http://0.0.0.0:2380",
+      "--initial-advertise-peer-urls", "http://milvus-etcd:2380",
+      "--initial-cluster", "milvus-etcd=http://milvus-etcd:2380",
+      "--initial-cluster-state", "new",
+      "--initial-cluster-token", "etcd-cluster"
+    ]
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+      - TZ=UTC
+    volumes:
+      - etcd-data:/etcd-data
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    networks:
+      - chat-network
+    restart: unless-stopped
+
+  # Servicio MinIO para almacenamiento persistente
+  minio:
+    image: minio/minio:latest
+    container_name: milvus-minio
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+      - TZ=UTC
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - chat-network
+    restart: unless-stopped
+
+  # Servicio de base de datos Milvus
+  milvus:
+    image: milvusdb/milvus:v2.2.11
+    container_name: milvus
+    command: ["/milvus/bin/milvus", "run", "standalone"]
+    ports:
+      - "19530:19530"   # gRPC
+      - "9091:9091"     # REST/metrics
+    environment:
+      - TZ=UTC
+      - ETCD_ENDPOINTS=http://milvus-etcd:2379
+      - MINIO_ADDRESS=milvus-minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+    volumes:
+      - milvus-data:/var/lib/milvus
+    depends_on:
+      - etcd
+      - minio
+    networks:
+      - chat-network
+    restart: unless-stopped
+
+volumes:
+  etcd-data:
+  minio-data:
+  milvus-data:
 
 networks:
   chat-network:

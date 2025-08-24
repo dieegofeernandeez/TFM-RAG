@@ -67,42 +67,6 @@ async def chat(request: ChatRequest):
     except Exception as e:
         logger.error(f"Groq API error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-async def chat_with_Llama(request: ChatRequest):
-    try:
-        logger.info(f"Received chat request with {len(request.messages)} messages")
-        
-        # Convertir mensajes al formato de Llama
-        Llama_messages = [
-            {"role": msg.role, "content": msg.content}
-            for msg in request.messages
-        ]
-        
-        # Llamar a Llama
-        response = client.chat.completions.create(
-            model=request.model,
-            messages=Llama_messages,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens
-        )
-        
-        # Extraer respuesta
-        ai_response = response.choices[0].message.content
-        usage_info = {
-            "prompt_tokens": response.usage.prompt_tokens,
-            "completion_tokens": response.usage.completion_tokens,
-            "total_tokens": response.usage.total_tokens
-        }
-        
-        logger.info(f"Llama response generated successfully. Tokens used: {usage_info['total_tokens']}")
-        
-        return ChatResponse(
-            response=ai_response,
-            usage=usage_info
-        )
-        
-    except Exception as e:
-        logger.error(f"Error processing chat request: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
 
 @app.post("/chat/stream")
 async def chat_stream(request: ChatRequest):

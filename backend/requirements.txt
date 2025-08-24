@@ -3,3 +3,7 @@ uvicorn==0.24.0
 groq
 pydantic==2.5.0
 python-multipart==0.0.6
+pymilvus
+pandas
+transformers 
+torch

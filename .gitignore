@@ -1,5 +1,2 @@
-.env
-docker-compose.yml.env
-*.env
-.env.*
+Milvus_wiki_0.ipynb
 
