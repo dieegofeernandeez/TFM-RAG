@@ -6,6 +6,11 @@ import os
 from typing import List, Optional
 import logging
 
+# --- nuevos imports para RAG
+from transformers import AutoTokenizer, AutoModel
+import torch
+from pymilvus import connections, Collection, utility, FieldSchema, CollectionSchema, DataType
+
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -22,8 +27,83 @@ app.add_middleware(
 )
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3-70b-8192")
+# Modelo primario configurable y lista de fallback si no existe / acceso denegado
+PRIMARY_GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")
+FALLBACK_MODELS = [
+    "llama3-8b-8192",
+    "llama3-70b-8192",
+    "mixtral-8x7b-32768"
+]
 client = Groq(api_key=GROQ_API_KEY)
+
+# --- Cargar modelo para embeddings (reutilizable por los endpoints RAG)
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+logger.info(f"Cargando modelo de embeddings: {EMBED_MODEL_NAME}")
+_tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_NAME)
+_model = AutoModel.from_pretrained(EMBED_MODEL_NAME)
+
+# Función de mean pooling igual que en embedding_generator.py
+
+def _mean_pooling(model_output, attention_mask):
+    token_embeddings = model_output.last_hidden_state
+    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+    sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, dim=1)
+    sum_mask = torch.clamp(input_mask_expanded.sum(dim=1), min=1e-9)
+    return (sum_embeddings / sum_mask)
+
+# Conectar a Milvus (host y puerto desde variables de entorno para flexibilidad)
+MILVUS_HOST = os.getenv("MILVUS_HOST", "milvus")
+MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
+try:
+    connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
+    logger.info(f"Conectado a Milvus en {MILVUS_HOST}:{MILVUS_PORT}")
+except Exception as e:
+    logger.warning(f"No se pudo conectar a Milvus en inicio: {e}")
+
+def ensure_text_embeddings_collection(dim: int = 384) -> Collection:
+    """Ensure the 'text_embeddings' collection exists in Milvus. If not, create it with a basic schema and an IVF_FLAT index.
+    Returns the Collection instance (loaded) or raises an exception on failure.
+    """
+    try:
+        # reconectar si hace falta
+        try:
+            connections.connect("default")
+        except Exception:
+            pass
+
+        if not utility.has_collection("text_embeddings"):
+            logger.info("Colección 'text_embeddings' no existe. Creando...")
+            fields = [
+                FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
+                FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=dim),
+                FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=500)
+            ]
+            schema = CollectionSchema(fields, description="Colección de embeddings de texto")
+            col = Collection("text_embeddings", schema=schema)
+
+            # Crear índice vectorial
+            try:
+                index_params = {"index_type": "IVF_FLAT", "metric_type": "L2", "params": {"nlist": 1024}}
+                col.create_index(field_name="embedding", index_params=index_params)
+                logger.info("Índice creado para 'text_embeddings'")
+            except Exception as e:
+                logger.warning(f"No se pudo crear índice (puede ser tolerable): {e}")
+
+            col.load()
+            logger.info("Colección 'text_embeddings' creada y cargada.")
+            return col
+        else:
+            col = Collection("text_embeddings")
+            # Intentar cargar si no está cargada
+            try:
+                col.load()
+            except Exception:
+                pass
+            return col
+
+    except Exception as e:
+        logger.error(f"Fallo asegurando colección text_embeddings: {e}")
+        raise
 
 # Modelos Pydantic
 class Message(BaseModel):
@@ -32,13 +112,24 @@ class Message(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: List[Message]
-    model: Optional[str] = GROQ_MODEL
+    model: Optional[str] = PRIMARY_GROQ_MODEL
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = 1000
 
 class ChatResponse(BaseModel):
     response: str
     usage: dict
+
+# Nuevos modelos para RAG
+class RagRequest(BaseModel):
+    question: str
+    top_k: Optional[int] = 5
+    use_llm: Optional[bool] = True
+    model: Optional[str] = PRIMARY_GROQ_MODEL
+
+class RagRetrieveResponse(BaseModel):
+    contexts: List[str]
+    distances: List[float]
 
 @app.get("/")
 async def root():
@@ -48,24 +139,129 @@ async def root():
 async def health_check():
     return {"status": "healthy", "service": "groq-llama-3.1"}
 
+def _call_groq_chat(model: str, messages: List[dict], temperature: float, max_tokens: int):
+    """Intenta llamar al modelo especificado y aplica fallback si model_not_found."""
+    tried = []
+    candidate_models = [model] + [m for m in FALLBACK_MODELS if m != model]
+    last_exc = None
+    for m in candidate_models:
+        try:
+            logger.info(f"Llamando Groq model={m}")
+            resp = client.chat.completions.create(
+                model=m,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+            if m != model:
+                logger.warning(f"Se usó modelo fallback '{m}' (solicitado '{model}').")
+            return resp, m
+        except Exception as ex:  # Groq no tiene excepción tipificada aquí en el SDK simple
+            err_txt = str(ex)
+            tried.append((m, err_txt))
+            # Detectar error de modelo inexistente
+            if 'model_not_found' in err_txt or 'does not exist' in err_txt:
+                logger.warning(f"Modelo {m} no disponible. Probando siguiente...")
+                last_exc = ex
+                continue
+            last_exc = ex
+    # Si todos fallan
+    raise last_exc or Exception("No se pudo completar la llamada a Groq")
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     try:
         groq_messages = [
             {"role": m.role, "content": m.content} for m in request.messages
         ]
-        response = client.chat.completions.create(
-            model=request.model,
+        raw_resp, used_model = _call_groq_chat(
+            model=request.model or PRIMARY_GROQ_MODEL,
             messages=groq_messages,
             temperature=request.temperature,
             max_tokens=request.max_tokens
         )
         return ChatResponse(
-            response=response.choices[0].message.content,
-            usage=response.usage.dict() if hasattr(response, "usage") else {}
+            response=raw_resp.choices[0].message.content,
+            usage=raw_resp.usage.dict() if hasattr(raw_resp, "usage") else {"model": used_model}
         )
     except Exception as e:
         logger.error(f"Groq API error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Endpoint que solo recupera los contextos desde Milvus
+@app.post("/rag/retrieve", response_model=RagRetrieveResponse)
+async def rag_retrieve(request: RagRequest):
+    try:
+        question = request.question
+        top_k = request.top_k or 5
+
+        # Asegurar conexión a Milvus
+        try:
+            connections.connect("default")
+        except Exception:
+            pass
+
+        # Asegurar que la colección existe (se crea si falta)
+        col = ensure_text_embeddings_collection(dim=384)
+
+        # Calcular embedding de la pregunta
+        inputs = _tokenizer(question, return_tensors='pt', truncation=True, padding=True, max_length=512)
+        with torch.no_grad():
+            outputs = _model(**inputs)
+            q_emb = _mean_pooling(outputs, inputs['attention_mask']).squeeze().cpu().numpy().tolist()
+
+        search_params = {"metric_type": "L2", "params": {"nprobe": 10}}
+        results = col.search(
+            data=[q_emb],
+            anns_field="embedding",
+            param=search_params,
+            limit=top_k,
+            output_fields=["text"]
+        )
+
+        contexts = []
+        distances = []
+        for r in results[0]:
+            contexts.append(r.entity.get("text"))
+            distances.append(r.distance)
+        logger.info(f"RAG retrieve: devueltos {len(contexts)}/{top_k} contextos")
+        return RagRetrieveResponse(contexts=contexts, distances=distances)
+
+    except Exception as e:
+        logger.error(f"RAG retrieve error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Endpoint RAG completo: recuperar + llamar a Groq para generar respuesta usando los contextos
+@app.post("/rag", response_model=ChatResponse)
+async def rag(request: RagRequest):
+    try:
+        # Recuperar contextos
+        retrieve_req = RagRequest(question=request.question, top_k=request.top_k)
+        retrieve_res = await rag_retrieve(retrieve_req)
+
+        # Construir prompt con contextos
+        context_text = "\n\n--- Contextos relevantes (extraídos del corpus) ---\n\n"
+        for i, c in enumerate(retrieve_res.contexts):
+            context_text += f"[{i+1}] {c}\n\n"
+
+        system_message = {"role": "system", "content": "Utiliza los siguientes fragmentos de contexto para responder de forma concisa y precisa a la pregunta del usuario. Si la respuesta no está en los contextos, responde indicando que no se encontró información relevante."}
+        # Mensajes: primero contexto como system + luego user question
+        messages = [system_message, {"role": "user", "content": context_text + "\nPregunta: " + request.question}]
+
+        # Llamar a Groq para generar respuesta
+        raw_resp, used_model = _call_groq_chat(
+            model=request.model or PRIMARY_GROQ_MODEL,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=800
+        )
+        return ChatResponse(
+            response=raw_resp.choices[0].message.content,
+            usage=raw_resp.usage.dict() if hasattr(raw_resp, "usage") else {"model": used_model}
+        )
+
+    except Exception as e:
+        logger.error(f"RAG error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/chat/stream")
@@ -102,3 +298,32 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+# Endpoint de diagnóstico para revisar estado del RAG
+@app.get("/rag/status")
+async def rag_status():
+    try:
+        info = {}
+        try:
+            connections.connect("default")
+        except Exception:
+            pass
+        exists = utility.has_collection("text_embeddings")
+        info["collection_exists"] = exists
+        if exists:
+            col = Collection("text_embeddings")
+            try:
+                count = col.num_entities
+            except Exception:
+                count = None
+            info["num_entities"] = count
+            try:
+                indexes = col.indexes
+                info["indexes"] = [idx.to_dict() if hasattr(idx, 'to_dict') else str(idx) for idx in indexes]
+            except Exception as e:
+                info["indexes_error"] = str(e)
+        info["primary_model"] = PRIMARY_GROQ_MODEL
+        info["fallback_models"] = FALLBACK_MODELS
+        return info
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

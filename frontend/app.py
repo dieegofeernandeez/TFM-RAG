@@ -10,7 +10,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 API_BACKEND_URL = os.getenv("API_BACKEND_URL", "http://localhost:8000")
-
+USE_RAG = os.getenv("USE_RAG", "true").lower() == "true"
+RAG_TOPK = int(os.getenv("RAG_TOPK", "5"))
 
 # Configuración de timeouts
 HEALTH_CHECK_TIMEOUT = 10
@@ -77,24 +78,36 @@ class ChatSession:
         self.add_message("user", user_message)
         
         try:
-            # Preparar payload
-            payload = {
-                "messages": self.messages,
-                "model": os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
-                "temperature": 0.7,
-                "max_tokens": 1000
-            }
-            
-            logger.info(f"Sending request to {API_BACKEND_URL}/chat")
-            
-            # Hacer llamada al backend
-            response = requests.post(
-                f"{API_BACKEND_URL}/chat",
-                json=payload,
-                timeout=QUERY_TIMEOUT,
-                headers={"Content-Type": "application/json"}
-            )
-            
+            if USE_RAG:
+                # Llamar al endpoint RAG del backend
+                payload = {
+                    "question": user_message,
+                    "top_k": RAG_TOPK,
+                    "use_llm": True
+                }
+                logger.info(f"Sending RAG request to {API_BACKEND_URL}/rag")
+                response = requests.post(
+                    f"{API_BACKEND_URL}/rag",
+                    json=payload,
+                    timeout=QUERY_TIMEOUT,
+                    headers={"Content-Type": "application/json"}
+                )
+            else:
+                # Fallback: llamar al endpoint /chat
+                payload = {
+                    "messages": self.messages,
+                    "model": os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+                    "temperature": 0.7,
+                    "max_tokens": 1000
+                }
+                logger.info(f"Sending request to {API_BACKEND_URL}/chat")
+                response = requests.post(
+                    f"{API_BACKEND_URL}/chat",
+                    json=payload,
+                    timeout=QUERY_TIMEOUT,
+                    headers={"Content-Type": "application/json"}
+                )
+
             if response.status_code == 200:
                 data = validate_api_response(response)
                 

@@ -10,10 +10,18 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - GROQ_API_KEY=
       - PORT=8000
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
+      # Coloca tu clave real (o usa variable externa)
+      - GROQ_API_KEY=
     volumes:
       - ./backend:/app
+    depends_on:
+      - milvus
+      - minio
+      - etcd
     restart: unless-stopped
     networks:
       - chat-network
@@ -27,12 +35,13 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - API_BACKEND_URL=http://api-backend:8000
-      - CHAINLIT_PORT=8080
-    depends_on:
-      - api-backend
+      - API_BACKEND_URL=http://groq-api:8000
+      - USE_RAG=true
+      - RAG_TOPK=5
     volumes:
       - ./frontend:/app
+    depends_on:
+      - api-backend
     restart: unless-stopped
     networks:
       - chat-network
@@ -43,15 +52,15 @@ services:
     container_name: milvus-etcd
     command: [
       "/usr/local/bin/etcd",
-      "--name", "milvus-etcd",
-      "--data-dir", "/etcd-data",
-      "--listen-client-urls", "http://0.0.0.0:2379",
-      "--advertise-client-urls", "http://milvus-etcd:2379",
-      "--listen-peer-urls", "http://0.0.0.0:2380",
-      "--initial-advertise-peer-urls", "http://milvus-etcd:2380",
-      "--initial-cluster", "milvus-etcd=http://milvus-etcd:2380",
-      "--initial-cluster-state", "new",
-      "--initial-cluster-token", "etcd-cluster"
+      "--name","milvus-etcd",
+      "--data-dir","/etcd-data",
+      "--listen-client-urls","http://0.0.0.0:2379",
+      "--advertise-client-urls","http://milvus-etcd:2379",
+      "--listen-peer-urls","http://0.0.0.0:2380",
+      "--initial-advertise-peer-urls","http://milvus-etcd:2380",
+      "--initial-cluster","milvus-etcd=http://milvus-etcd:2380",
+      "--initial-cluster-state","new",
+      "--initial-cluster-token","etcd-cluster"
     ]
     environment:
       - ETCD_AUTO_COMPACTION_MODE=revision
@@ -64,9 +73,9 @@ services:
     ports:
       - "2379:2379"
       - "2380:2380"
+    restart: unless-stopped
     networks:
       - chat-network
-    restart: unless-stopped
 
   # Servicio MinIO para almacenamiento persistente
   minio:
@@ -82,32 +91,32 @@ services:
       - "9001:9001"
     volumes:
       - minio-data:/data
+    restart: unless-stopped
     networks:
       - chat-network
-    restart: unless-stopped
 
   # Servicio de base de datos Milvus
   milvus:
     image: milvusdb/milvus:v2.2.11
     container_name: milvus
-    command: ["/milvus/bin/milvus", "run", "standalone"]
-    ports:
-      - "19530:19530"   # gRPC
-      - "9091:9091"     # REST/metrics
+    command: ["/milvus/bin/milvus","run","standalone"]
     environment:
       - TZ=UTC
       - ETCD_ENDPOINTS=http://milvus-etcd:2379
       - MINIO_ADDRESS=milvus-minio:9000
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin
+    ports:
+      - "19530:19530"   # gRPC
+      - "9091:9091"     # metrics / http
     volumes:
       - milvus-data:/var/lib/milvus
     depends_on:
       - etcd
       - minio
+    restart: unless-stopped
     networks:
       - chat-network
-    restart: unless-stopped
 
 volumes:
   etcd-data:
