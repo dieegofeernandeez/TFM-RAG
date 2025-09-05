@@ -28,19 +28,28 @@ app.add_middleware(
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 # Modelo primario configurable y lista de fallback si no existe / acceso denegado
-PRIMARY_GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")
+PRIMARY_GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+# Lista de modelos vigentes (ajusta según disponibilidad en tu cuenta Groq)
 FALLBACK_MODELS = [
-    "llama3-8b-8192",
-    "llama3-70b-8192",
-    "mixtral-8x7b-32768"
+    PRIMARY_GROQ_MODEL,
+    "llama-3.1-70b-versatile",
 ]
 client = Groq(api_key=GROQ_API_KEY)
 
-# --- Cargar modelo para embeddings (reutilizable por los endpoints RAG)
+"""Modelo de embeddings: carga diferida para reducir RAM inicial.
+Se carga la primera vez que se necesita (retrieve o ingest).
+"""
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-logger.info(f"Cargando modelo de embeddings: {EMBED_MODEL_NAME}")
-_tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_NAME)
-_model = AutoModel.from_pretrained(EMBED_MODEL_NAME)
+_tokenizer = None
+_model = None
+
+def get_embedding_model():
+    global _tokenizer, _model
+    if _tokenizer is None or _model is None:
+        logger.info(f"Cargando modelo de embeddings (lazy): {EMBED_MODEL_NAME}")
+        _tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_NAME)
+        _model = AutoModel.from_pretrained(EMBED_MODEL_NAME)
+    return _tokenizer, _model
 
 # Función de mean pooling igual que en embedding_generator.py
 
@@ -131,6 +140,9 @@ class RagRetrieveResponse(BaseModel):
     contexts: List[str]
     distances: List[float]
 
+class IngestRequest(BaseModel):
+    texts: List[str]
+
 @app.get("/")
 async def root():
     return {"message": "Groq Llama 3.1 Chat API is running"}
@@ -140,10 +152,11 @@ async def health_check():
     return {"status": "healthy", "service": "groq-llama-3.1"}
 
 def _call_groq_chat(model: str, messages: List[dict], temperature: float, max_tokens: int):
-    """Intenta llamar al modelo especificado y aplica fallback si model_not_found."""
-    tried = []
+    """Intenta llamar al modelo especificado y aplica fallback si el modelo no existe o está deprecado.
+    Devuelve (resp, modelo_utilizado) o lanza excepción final.
+    """
+    tried_errors = []
     candidate_models = [model] + [m for m in FALLBACK_MODELS if m != model]
-    last_exc = None
     for m in candidate_models:
         try:
             logger.info(f"Llamando Groq model={m}")
@@ -156,17 +169,20 @@ def _call_groq_chat(model: str, messages: List[dict], temperature: float, max_to
             if m != model:
                 logger.warning(f"Se usó modelo fallback '{m}' (solicitado '{model}').")
             return resp, m
-        except Exception as ex:  # Groq no tiene excepción tipificada aquí en el SDK simple
+        except Exception as ex:
             err_txt = str(ex)
-            tried.append((m, err_txt))
-            # Detectar error de modelo inexistente
-            if 'model_not_found' in err_txt or 'does not exist' in err_txt:
-                logger.warning(f"Modelo {m} no disponible. Probando siguiente...")
-                last_exc = ex
+            tried_errors.append((m, err_txt))
+            lower_err = err_txt.lower()
+            # Patrones de errores tolerables para intentar siguiente modelo
+            if any(pat in lower_err for pat in ["model_not_found", "does not exist", "decommissioned", "model_decommissioned", "invalid_request_error"]):
+                logger.warning(f"Modelo {m} no disponible/deprecado ({err_txt}). Probando siguiente...")
                 continue
-            last_exc = ex
-    # Si todos fallan
-    raise last_exc or Exception("No se pudo completar la llamada a Groq")
+            # Errores no recuperables (auth, rate limit, etc.) se relanzan
+            logger.error(f"Error no recuperable con modelo {m}: {err_txt}")
+            raise
+    # Si todos fallan con errores de 'modelo no disponible'
+    summary = "; ".join([f"{m}:{e}" for m, e in tried_errors])
+    raise HTTPException(status_code=400, detail=f"Ningún modelo disponible. Errores: {summary}")
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
@@ -204,10 +220,11 @@ async def rag_retrieve(request: RagRequest):
         # Asegurar que la colección existe (se crea si falta)
         col = ensure_text_embeddings_collection(dim=384)
 
-        # Calcular embedding de la pregunta
-        inputs = _tokenizer(question, return_tensors='pt', truncation=True, padding=True, max_length=512)
+        # Calcular embedding de la pregunta (carga lazy)
+        tokenizer, model = get_embedding_model()
+        inputs = tokenizer(question, return_tensors='pt', truncation=True, padding=True, max_length=512)
         with torch.no_grad():
-            outputs = _model(**inputs)
+            outputs = model(**inputs)
             q_emb = _mean_pooling(outputs, inputs['attention_mask']).squeeze().cpu().numpy().tolist()
 
         search_params = {"metric_type": "L2", "params": {"nprobe": 10}}
@@ -262,6 +279,43 @@ async def rag(request: RagRequest):
 
     except Exception as e:
         logger.error(f"RAG error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/rag/ingest")
+async def rag_ingest(req: IngestRequest):
+    """Ingesta una lista de textos en la colección 'text_embeddings'.
+    Trunca cada texto a 500 caracteres (schema VARCHAR(500)).
+    """
+    try:
+        if not req.texts:
+            raise HTTPException(status_code=400, detail="Lista 'texts' vacía")
+        try:
+            connections.connect("default")
+        except Exception:
+            pass
+        col = ensure_text_embeddings_collection(dim=384)
+        tokenizer, model = get_embedding_model()
+        embeddings = []
+        stored_texts = []
+        for t in req.texts:
+            if not t or not t.strip():
+                continue
+            inputs = tokenizer(t, return_tensors='pt', truncation=True, padding=True, max_length=512)
+            with torch.no_grad():
+                outputs = model(**inputs)
+                emb = _mean_pooling(outputs, inputs['attention_mask']).squeeze().cpu().numpy().tolist()
+            embeddings.append(emb)
+            stored_texts.append(t[:500])
+        if not embeddings:
+            raise HTTPException(status_code=400, detail="No se generaron embeddings válidos")
+        # Insertar (id auto por schema)
+        col.insert([embeddings, stored_texts])
+        col.flush()
+        return {"inserted": len(embeddings)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ingest error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/chat/stream")

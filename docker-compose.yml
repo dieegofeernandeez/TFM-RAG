@@ -16,8 +16,10 @@ services:
       - EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
       # Coloca tu clave real (o usa variable externa)
       - GROQ_API_KEY=
+      - EMBED_CSV=/data/wiki_scraped.csv
     volumes:
       - ./backend:/app
+      - ./data:/data:ro
     depends_on:
       - milvus
       - minio
