@@ -14,6 +14,15 @@ services:
       - EMBED_MODEL=BAAI/bge-m3
       - EMBED_NORMALIZE=true
       - METRIC_TYPE=IP
+  # RAG tuning
+      - NPROBE_SEARCH=48
+      - RERANK_FETCH_MULT=5
+      - RERANK_TEXT_BOOST=0.25
+      - RERANK_MMR=true
+      - RERANK_MMR_LAMBDA=0.7
+      - RAG_MAX_TOKENS=1400
+      - EXPAND_NEIGHBORS=true
+      - NEIGHBOR_RADIUS=2
       - GROQ_API_KEY=
       - EMBED_COLLECTION=text_embeddings
   # Cache HF para no volver a descargar el modelo grande en cada build/run

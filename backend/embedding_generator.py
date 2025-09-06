@@ -92,6 +92,8 @@ def ensure_collection(dim: int) -> Collection:
             FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
             FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=dim),
             FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=1000),
+            FieldSchema(name="doc_id", dtype=DataType.VARCHAR, max_length=400),
+            FieldSchema(name="position", dtype=DataType.INT64),
             FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=200),
             FieldSchema(name="category", dtype=DataType.VARCHAR, max_length=80),
             FieldSchema(name="section", dtype=DataType.VARCHAR, max_length=120),
@@ -232,6 +234,7 @@ def ingest_jsonl(path: str):
     SECTION_MAX = _get_max_len("section", 120)
     SOURCE_MAX = _get_max_len("source_type", 32)
     URL_MAX = _get_max_len("url", 400)
+    DOCID_MAX = _get_max_len("doc_id", 400)
 
     # Recorte por bytes UTF-8: Milvus puede validar max_length por bytes, no por caracteres
     def _trim_to_max_bytes(s: object, max_bytes: int) -> str:
@@ -272,6 +275,17 @@ def ingest_jsonl(path: str):
     sections = [_trim_to_max_bytes(r.get("section", ""), SECTION_MAX) for r in rows]
     source_types = [_trim_to_max_bytes(r.get("source_type", ""), SOURCE_MAX) for r in rows]
     urls = [_trim_to_max_bytes(r.get("url", ""), URL_MAX) for r in rows]
+    # doc_id preferentemente la URL; si no hay, usar combinación estable (source_type + title)
+    def _mk_doc_id(r: dict) -> str:
+        u = str(r.get("url", "") or "").strip()
+        if u:
+            return u
+        st = str(r.get("source_type", "") or "").strip()
+        ti = str(r.get("title", "") or "").strip()
+        base = f"{st}|{ti}" if (st or ti) else str(r.get("id", ""))
+        return base
+    doc_ids = [_trim_to_max_bytes(_mk_doc_id(r), DOCID_MAX) for r in rows]
+    positions = [int(r.get("position", 0) or 0) for r in rows]
 
     # Segundo pase de seguridad y métricas de recorte
     def _enforce_and_count_bytes(items: list[str], max_bytes: int, label: str) -> list[str]:
@@ -293,6 +307,7 @@ def ingest_jsonl(path: str):
     sections = _enforce_and_count_bytes(sections, SECTION_MAX, "section")
     source_types = _enforce_and_count_bytes(source_types, SOURCE_MAX, "source_type")
     urls = _enforce_and_count_bytes(urls, URL_MAX, "url")
+    doc_ids = _enforce_and_count_bytes(doc_ids, DOCID_MAX, "doc_id")
 
     if EMBED_LIMIT and EMBED_LIMIT > 0:
         logger.info(f"EMBED_LIMIT activo → procesando solo los primeros {EMBED_LIMIT} registros")
@@ -302,6 +317,8 @@ def ingest_jsonl(path: str):
         sections = sections[:EMBED_LIMIT]
         source_types = source_types[:EMBED_LIMIT]
     urls = urls[:EMBED_LIMIT]
+    doc_ids = doc_ids[:EMBED_LIMIT]
+    positions = positions[:EMBED_LIMIT]
 
     logger.info("Generando embeddings...")
     embeddings = embed_texts(texts)
@@ -313,11 +330,13 @@ def ingest_jsonl(path: str):
         rows_to_insert.append({
             "embedding": embeddings[i],  # list[float]
             "text": texts[i],
-            "title": titles[i],
-            "category": categories[i],
-            "section": sections[i],
-            "source_type": source_types[i],
-            "url": urls[i],
+            "doc_id": doc_ids[i] if i < len(doc_ids) else "",
+            "position": int(positions[i] if i < len(positions) else 0),
+            "title": titles[i] if i < len(titles) else "",
+            "category": categories[i] if i < len(categories) else "",
+            "section": sections[i] if i < len(sections) else "",
+            "source_type": source_types[i] if i < len(source_types) else "",
+            "url": urls[i] if i < len(urls) else "",
         })
     insert_res = col.insert(rows_to_insert)
     logger.info(f"Insertadas {len(texts)} filas. Ejemplo IDs: {insert_res.primary_keys[:3]}")

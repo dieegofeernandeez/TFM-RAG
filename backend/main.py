@@ -3,9 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import Groq
 import os
-from typing import List, Optional
+from typing import List, Optional, Set
 import logging
 from contextlib import suppress
+import unicodedata
+import re
 
 # --- nuevos imports para RAG
 from transformers import AutoTokenizer, AutoModel
@@ -47,10 +49,17 @@ IS_BGE_M3 = "bge-m3" in EMBED_MODEL_NAME.lower()
 
 # Re-ranking configurable
 RERANK_ENABLE = os.getenv("RERANK_ENABLE", "true").lower() == "true"
-RERANK_FETCH_MULT = int(os.getenv("RERANK_FETCH_MULT", "3"))  # multiplicador de candidatos iniciales
+RERANK_FETCH_MULT = int(os.getenv("RERANK_FETCH_MULT", "5"))  # multiplicador de candidatos iniciales
 RERANK_TITLE_BOOST = float(os.getenv("RERANK_TITLE_BOOST", "0.35"))
 RERANK_SECTION_BOOST = float(os.getenv("RERANK_SECTION_BOOST", "0.15"))
+RERANK_TEXT_BOOST = float(os.getenv("RERANK_TEXT_BOOST", "0.25"))
 RERANK_POSITION_DECAY = float(os.getenv("RERANK_POSITION_DECAY", "0.02"))  # penalización leve por posición tardía en texto (si incluyéramos position)
+RERANK_MMR = os.getenv("RERANK_MMR", "true").lower() == "true"
+RERANK_MMR_LAMBDA = float(os.getenv("RERANK_MMR_LAMBDA", "0.7"))
+NPROBE_SEARCH = int(os.getenv("NPROBE_SEARCH", "48"))
+RAG_MAX_TOKENS = int(os.getenv("RAG_MAX_TOKENS", "1400"))
+EXPAND_NEIGHBORS = os.getenv("EXPAND_NEIGHBORS", "false").lower() == "true"
+NEIGHBOR_RADIUS = int(os.getenv("NEIGHBOR_RADIUS", "1"))
 _tokenizer = None
 _model = None
 _fe_bge_model = None  # FlagEmbedding para BGE-M3
@@ -126,13 +135,45 @@ try:
 except Exception as e:
     logger.warning(f"No se pudo conectar a Milvus en inicio: {e}")
 
-def ensure_text_embeddings_collection(dim: int = 384) -> Collection:
-    """Asegura la colección con esquema extendido (text + metadatos)."""
+# --- Utilidades de texto para el reranker ---
+def strip_accents(s: str) -> str:
     try:
-        try:
+        return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+    except Exception:
+        return s
+
+STOPWORDS_ES: Set[str] = {
+    # Lista breve de stopwords comunes en español (se puede ampliar)
+    'el','la','los','las','un','una','unos','unas','y','o','u','de','del','al','a','en','por','para','con','sin','es','son','ser','se','que','qué','como','cómo','cuando','cuándo','donde','dónde','cual','cuál','cuales','cuáles','cuanto','cuánto','cuanta','cuánta','cuantos','cuántos','muy','mas','más','pero','si','sí','no','ya','lo','su','sus','mi','mis','tu','tus','su','sus','nuestro','nuestra','nuestros','nuestras','este','esta','estos','estas','ese','esa','esos','esas','aqui','aquí','alli','allí','ahi','ahí','debe','deben','debes','debo','hay','haber','he','ha','han','hace','hacen','hacer'
+}
+
+def tokenize_es(text: str) -> List[str]:
+    t = strip_accents(text.lower())
+    # separar por no-letras/números
+    parts = re.split(r"[^a-z0-9áéíóúñü]+", t)
+    return [p for p in parts if len(p) > 2 and p not in STOPWORDS_ES]
+
+def jaccard_set(a: Set[str], b: Set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    if inter == 0:
+        return 0.0
+    union = len(a | b)
+    if union == 0:
+        return 0.0
+    return inter / union
+
+def ensure_text_embeddings_collection(dim: int = 384) -> Collection:
+    """Asegura la colección con esquema extendido (text + metadatos), índice y carga en memoria.
+
+    - Evita llamar load() antes de crear el índice (para no disparar "index doesn't exist").
+    - Si no hay índice, lo crea y espera brevemente a que termine la construcción.
+    - Intenta cargar la colección; si falla, registra y devuelve igualmente el handler (el caller podrá decidir).
+    """
+    try:
+        with suppress(Exception):
             connections.connect("default")
-        except Exception:
-            pass
         name = "text_embeddings"
         if not utility.has_collection(name):
             logger.info("Colección 'text_embeddings' no existe. Creando (extendida)...")
@@ -140,6 +181,8 @@ def ensure_text_embeddings_collection(dim: int = 384) -> Collection:
                 FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
                 FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=dim),
                 FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=1000),
+                FieldSchema(name="doc_id", dtype=DataType.VARCHAR, max_length=400),
+                FieldSchema(name="position", dtype=DataType.INT64),
                 FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=200),
                 FieldSchema(name="category", dtype=DataType.VARCHAR, max_length=80),
                 FieldSchema(name="section", dtype=DataType.VARCHAR, max_length=120),
@@ -148,22 +191,56 @@ def ensure_text_embeddings_collection(dim: int = 384) -> Collection:
             ]
             schema = CollectionSchema(fields, description="Embeddings con metadatos unificados")
             col = Collection(name, schema=schema)
+            # Crear índice y cargar
             try:
                 index_params = {"index_type": "IVF_FLAT", "metric_type": METRIC_TYPE, "params": {"nlist": 1024}}
                 col.create_index(field_name="embedding", index_params=index_params)
             except Exception as e:
                 logger.warning(f"No se pudo crear índice inicial: {e}")
-            col.load()
+            with suppress(Exception):
+                col.load()
             return col
+
+        # Colección existente
         col = Collection(name)
-        try:
-            col.load()
-        except Exception:
-            pass
         existing = {f.name for f in col.schema.fields}
-        expected = {"text", "title", "category", "section", "source_type", "url"}
+        expected = {"text", "title", "category", "section", "source_type", "url", "doc_id", "position"}
         if not expected.issubset(existing):
             logger.warning("Colección existente sin todos los campos extendidos (%s). Reingesta recomendada.", expected - existing)
+
+        # Asegurar índice en 'embedding'
+        need_index = False
+        try:
+            idx_list = getattr(col, "indexes", [])
+            need_index = not idx_list
+        except Exception:
+            need_index = True
+        if need_index:
+            try:
+                index_params = {"index_type": "IVF_FLAT", "metric_type": METRIC_TYPE, "params": {"nlist": 1024}}
+                col.create_index(field_name="embedding", index_params=index_params)
+            except Exception as e:
+                logger.warning(f"No se pudo crear índice en colección existente: {e}")
+
+        # Esperar un poco a que termine el index build (rápido si está vacía)
+        try:
+            from time import sleep
+            for _ in range(10):  # ~1s total
+                try:
+                    prog = utility.index_building_progress(name)
+                    total = int(prog.get("total_rows", 0))
+                    indexed = int(prog.get("indexed_rows", 0))
+                    if total == 0 or indexed >= total:
+                        break
+                except Exception:
+                    break
+                sleep(0.1)
+        except Exception:
+            pass
+
+        # Cargar la colección
+        with suppress(Exception):
+            col.load()
         return col
     except Exception as e:
         logger.error(f"Fallo asegurando colección text_embeddings: {e}")
@@ -190,6 +267,9 @@ class RagRequest(BaseModel):
     top_k: Optional[int] = 5
     use_llm: Optional[bool] = True
     model: Optional[str] = PRIMARY_GROQ_MODEL
+    # overrides opcionales por petición (si no se envían, se usan los ENV)
+    expand_neighbors: Optional[bool] = None
+    neighbor_radius: Optional[int] = None
 
 class RetrievedContext(BaseModel):
     text: str
@@ -220,6 +300,16 @@ async def health_check():
     info["embed_model"] = EMBED_MODEL_NAME
     info["embed_normalize"] = EMBED_NORMALIZE
     info["metric_type"] = METRIC_TYPE
+    info["nprobe_search"] = NPROBE_SEARCH
+    info["rerank"] = {
+        "enable": RERANK_ENABLE,
+        "fetch_mult": RERANK_FETCH_MULT,
+        "title_boost": RERANK_TITLE_BOOST,
+        "section_boost": RERANK_SECTION_BOOST,
+        "text_boost": RERANK_TEXT_BOOST,
+        "mmr": RERANK_MMR,
+        "mmr_lambda": RERANK_MMR_LAMBDA,
+    }
     # Milvus / colección
     try:
         try:
@@ -313,26 +403,50 @@ async def chat(request: ChatRequest):
 # Endpoint que solo recupera los contextos desde Milvus
 @app.post("/rag/retrieve", response_model=RagRetrieveResponse)
 async def rag_retrieve(request: RagRequest):
-    try:
-        question = request.question.strip()
-        if not question:
-            raise HTTPException(status_code=400, detail="Pregunta vacía")
-        top_k = request.top_k or 5
-        try:
-            connections.connect("default")
-        except Exception:
-            pass
+    question = request.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Pregunta vacía")
+    top_k = request.top_k or 5
+
+    with suppress(Exception):
+        connections.connect("default")
     col = ensure_text_embeddings_collection(dim=1024 if IS_BGE_M3 else 384)
-        q_emb = encode_query(question)
+    q_emb = encode_query(question)
 
-        fetch_limit = top_k * RERANK_FETCH_MULT if RERANK_ENABLE else top_k
-        search_params = {"metric_type": METRIC_TYPE, "params": {"nprobe": 10}}
-        # Determinar output_fields disponibles (compatibilidad con colecciones antiguas sin 'url')
-        available_fields = {f.name for f in col.schema.fields}
-        wanted_fields = ["text", "title", "category", "section", "source_type"]
-        if "url" in available_fields:
-            wanted_fields.append("url")
+    fetch_limit = top_k * RERANK_FETCH_MULT if RERANK_ENABLE else top_k
+    search_params = {"metric_type": METRIC_TYPE, "params": {"nprobe": NPROBE_SEARCH}}
+    # Determinar output_fields disponibles (compatibilidad con colecciones antiguas sin 'url')
+    available_fields = {f.name for f in col.schema.fields}
+    wanted_fields = ["text", "title", "category", "section", "source_type"]
+    if "url" in available_fields:
+        wanted_fields.append("url")
+    if "doc_id" in available_fields:
+        wanted_fields.append("doc_id")
+    if "position" in available_fields:
+        wanted_fields.append("position")
 
+    # Si la colección está vacía, devolvemos sin contextos para evitar error Milvus
+    try:
+        if getattr(col, 'num_entities', 0) == 0:
+            logger.info("Colección vacía: devolviendo sin contextos")
+            return RagRetrieveResponse(contexts=[])
+    except Exception:
+        pass
+
+    # Intentar cargar la colección antes de buscar
+    with suppress(Exception):
+        col.load()
+
+    # Si sigue vacía o no cargada, devolver vacío
+    try:
+        if getattr(col, 'num_entities', 0) == 0:
+            logger.info("Colección vacía o no cargada: devolviendo sin contextos")
+            return RagRetrieveResponse(contexts=[])
+    except Exception:
+        return RagRetrieveResponse(contexts=[])
+
+    # Ejecutar búsqueda, capturando errores de carga/índice
+    try:
         results = col.search(
             data=[q_emb],
             anns_field="embedding",
@@ -340,75 +454,182 @@ async def rag_retrieve(request: RagRequest):
             limit=fetch_limit,
             output_fields=wanted_fields
         )
-
-        raw = []
-        for r in results[0]:
-            ent = r.entity
-            item = {
-                "text": ent.get("text"),
-                "title": ent.get("title") or "",
-                "category": ent.get("category") or "",
-                "section": ent.get("section") or "",
-                "source_type": ent.get("source_type") or "",
-                "distance": r.distance
-            }
-            if "url" in available_fields:
-                item["url"] = ent.get("url") or ""
-            raw.append(item)
-
-        # Re-ranking ligero
-        if RERANK_ENABLE and raw:
-            q_terms = [t for t in question.lower().split() if len(t) > 2]
-            def term_match_score(text: str, terms: List[str]) -> float:
-                lt = text.lower()
-                hits = sum(1 for t in terms if t in lt)
-                return hits / max(1, len(terms))
-            reranked = []
-            for item in raw:
-                base_sim = item['distance'] if METRIC_TYPE.upper() == 'IP' else -item['distance']
-                title_bonus = term_match_score(item['title'], q_terms) * RERANK_TITLE_BOOST
-                section_bonus = term_match_score(item['section'], q_terms) * RERANK_SECTION_BOOST
-                length_penalty = 0.0
-                l = len(item['text']) if item['text'] else 0
-                if l > 950:
-                    length_penalty = 0.05
-                score = base_sim + title_bonus + section_bonus - length_penalty
-                item['score'] = score
-                reranked.append(item)
-            reranked.sort(key=lambda x: x['score'], reverse=True)
-            selected = reranked[:top_k]
-        else:
-            for item in raw:
-                item['score'] = item['distance'] if METRIC_TYPE.upper() == 'IP' else -item['distance']
-            selected = raw[:top_k]
-
-        contexts: List[RetrievedContext] = [
-            RetrievedContext(
-                text=i['text'],
-                title=i['title'],
-                category=i['category'],
-                section=i['section'],
-                source_type=i['source_type'],
-                distance=i['distance'],
-                score=i['score'],
-                url=i.get('url') or None
-            ) for i in selected
-        ]
-        logger.info(f"RAG retrieve: candidatos={len(raw)} devueltos={len(contexts)} rerank={'on' if RERANK_ENABLE else 'off'}")
-        return RagRetrieveResponse(contexts=contexts)
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"RAG retrieve error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Milvus search error: {e}")
+        return RagRetrieveResponse(contexts=[])
+
+    raw = []
+    for r in results[0]:
+        ent = r.entity
+        item = {
+            "text": ent.get("text"),
+            "title": ent.get("title") or "",
+            "category": ent.get("category") or "",
+            "section": ent.get("section") or "",
+            "source_type": ent.get("source_type") or "",
+            "distance": r.distance
+        }
+        if "url" in available_fields:
+            item["url"] = ent.get("url") or ""
+        if "doc_id" in available_fields:
+            item["doc_id"] = ent.get("doc_id") or ""
+        if "position" in available_fields:
+            try:
+                item["position"] = int(ent.get("position"))
+            except Exception:
+                item["position"] = None
+        # tokenizar para posibles MMR/diversidad
+        try:
+            item["_tokens"] = set(tokenize_es(item["text"] or ""))
+        except Exception:
+            item["_tokens"] = set()
+        raw.append(item)
+
+    # Re-ranking ligero
+    if RERANK_ENABLE and raw:
+        q_terms = tokenize_es(question)
+        def term_match_score(text: str, terms: List[str]) -> float:
+            if not text:
+                return 0.0
+            ltoks = set(tokenize_es(text))
+            if not ltoks or not terms:
+                return 0.0
+            hits = sum(1 for t in terms if t in ltoks)
+            return hits / max(1, len(terms))
+        reranked = []
+        for item in raw:
+            base_sim = item['distance'] if METRIC_TYPE.upper() == 'IP' else -item['distance']
+            title_bonus = term_match_score(item['title'], q_terms) * RERANK_TITLE_BOOST
+            section_bonus = term_match_score(item['section'], q_terms) * RERANK_SECTION_BOOST
+            text_bonus = term_match_score(item['text'], q_terms) * RERANK_TEXT_BOOST
+            length_penalty = 0.0
+            l = len(item['text']) if item['text'] else 0
+            if l > 950:
+                length_penalty = 0.05
+            score = base_sim + title_bonus + section_bonus + text_bonus - length_penalty
+            item['score'] = score
+            reranked.append(item)
+        reranked.sort(key=lambda x: x['score'], reverse=True)
+        # Diversidad MMR opcional basada en Jaccard de tokens
+        if RERANK_MMR:
+            selected_mm: List[dict] = []
+            pool = reranked.copy()
+            while pool and len(selected_mm) < top_k:
+                if not selected_mm:
+                    selected_mm.append(pool.pop(0))
+                    continue
+                best_idx = -1
+                best_mmr = -1e9
+                for i, cand in enumerate(pool[: min(len(pool), 200) ]):
+                    sim = 0.0
+                    for s in selected_mm:
+                        sim = max(sim, jaccard_set(cand.get("_tokens", set()), s.get("_tokens", set())))
+                    mmr_score = RERANK_MMR_LAMBDA * cand['score'] - (1.0 - RERANK_MMR_LAMBDA) * sim
+                    if mmr_score > best_mmr:
+                        best_mmr = mmr_score
+                        best_idx = i
+                if best_idx >= 0:
+                    selected_mm.append(pool.pop(best_idx))
+                else:
+                    break
+            selected = selected_mm
+        else:
+            selected = reranked[:top_k]
+    else:
+        for item in raw:
+            item['score'] = item['distance'] if METRIC_TYPE.upper() == 'IP' else -item['distance']
+        selected = raw[:top_k]
+
+    # Determinar overrides por petición o usar ENV
+    expand_neighbors = EXPAND_NEIGHBORS if request.expand_neighbors is None else bool(request.expand_neighbors)
+    neighbor_radius = NEIGHBOR_RADIUS if request.neighbor_radius is None else int(request.neighbor_radius)
+
+    # Expansión de vecinos contiguos por doc_id/position (si existe en schema y está activado)
+    if expand_neighbors and selected and {"doc_id", "position"}.issubset(available_fields):
+        try:
+            with suppress(Exception):
+                col.load()
+            extra: List[dict] = []
+            for it in selected:
+                did = it.get("doc_id")
+                pos = it.get("position")
+                if not did or pos is None:
+                    continue
+                radius = max(1, neighbor_radius)
+                # construir lista de posiciones vecinas
+                neigh = [pos + d for d in range(-radius, radius + 1) if d != 0]
+                if not neigh:
+                    continue
+                safe_did = did.replace("'", "\\'")
+                expr = f"doc_id == '{safe_did}' and position in {neigh}"
+                try:
+                    neigh_rows = col.query(expr=expr, output_fields=wanted_fields)
+                except Exception:
+                    neigh_rows = []
+                for nr in neigh_rows:
+                    extra.append({
+                        "text": nr.get("text"),
+                        "title": nr.get("title") or "",
+                        "category": nr.get("category") or "",
+                        "section": nr.get("section") or "",
+                        "source_type": nr.get("source_type") or "",
+                        "distance": it.get("distance", 0.0),
+                        "score": it.get("score", 0.0) * 0.98,  # leve degradación por ser vecino
+                        "url": nr.get("url") or "",
+                        "doc_id": nr.get("doc_id") or did,
+                        "position": nr.get("position", None),
+                        "_tokens": set(tokenize_es(nr.get("text") or ""))
+                    })
+            # fusionar y deduplicar por (doc_id, position, text)
+            seen_keys = set()
+            fused: List[dict] = []
+            for it in (selected + extra):
+                k = (it.get("doc_id"), it.get("position"), it.get("text"))
+                if k in seen_keys:
+                    continue
+                seen_keys.add(k)
+                fused.append(it)
+            # ordenar por score y recortar a top_k (presupuesto)
+            fused.sort(key=lambda x: x.get('score', 0.0), reverse=True)
+            selected = fused[:top_k]
+        except Exception:
+            pass
+
+    contexts: List[RetrievedContext] = [
+        RetrievedContext(
+            text=i['text'],
+            title=i['title'],
+            category=i['category'],
+            section=i['section'],
+            source_type=i['source_type'],
+            distance=i['distance'],
+            score=i['score'],
+            url=i.get('url') or None
+        ) for i in selected
+    ]
+    logger.info(f"RAG retrieve: candidatos={len(raw)} devueltos={len(contexts)} rerank={'on' if RERANK_ENABLE else 'off'}")
+    return RagRetrieveResponse(contexts=contexts)
 
 # Endpoint RAG completo: recuperar + llamar a Groq para generar respuesta usando los contextos
 @app.post("/rag", response_model=ChatResponse)
 async def rag(request: RagRequest):
     try:
         # Recuperar contextos
-        retrieve_req = RagRequest(question=request.question, top_k=request.top_k)
+        retrieve_req = RagRequest(
+            question=request.question,
+            top_k=request.top_k,
+            expand_neighbors=request.expand_neighbors,
+            neighbor_radius=request.neighbor_radius,
+        )
         retrieve_res = await rag_retrieve(retrieve_req)
+        # Si no hay contextos, devolver respuesta amable sin LLM para evitar 500 y explicar el estado
+        if not retrieve_res.contexts:
+            msg = (
+                "No he encontrado contextos relevantes en la base de conocimiento aún. "
+                "Es posible que la colección esté vacía o la reingestión no haya finalizado. "
+                "Intenta de nuevo en unos minutos."
+            )
+            return ChatResponse(response=msg, usage={"model": request.model or PRIMARY_GROQ_MODEL, "note": "no_contexts"})
         context_text = "\n\n--- Contextos relevantes (cita siempre las fuentes con su URL) ---\n\n"
         for i, c in enumerate(retrieve_res.contexts):
             source_url = f" | URL: {c.url}" if c.url else ""
@@ -416,19 +637,29 @@ async def rag(request: RagRequest):
             context_text += f"[{i+1}] {meta}\n{c.text}\n\n"
 
         system_message = {"role": "system", "content": (
-            "Eres un asistente que contesta de forma breve y precisa, y siempre cita las fuentes. "
+            "Eres un asistente que responde de forma clara, completa y bien estructurada, y siempre cita las fuentes. "
             "Responde solo con información presente en los contextos. "
+            "Estructura la respuesta con secciones y listas cuando ayude a la comprensión. "
             "Incluye una sección 'Fuentes' al final con las URLs de los fragmentos utilizados. "
             "Si no hay información suficiente, dilo claramente."
         )}
         messages = [system_message, {"role": "user", "content": context_text + "\nPregunta: " + request.question}]
 
-        raw_resp, used_model = call_groq_with_fallback(
-            messages,
-            max_tokens=800,
-            temperature=0.0,
-            primary=request.model or PRIMARY_GROQ_MODEL
-        )
+        try:
+            raw_resp, used_model = call_groq_with_fallback(
+                messages,
+                max_tokens=RAG_MAX_TOKENS,
+                temperature=0.0,
+                primary=request.model or PRIMARY_GROQ_MODEL
+            )
+        except Exception as ex:
+            # Devolver respuesta controlada si falla el LLM (p. ej., sin red o clave)
+            fallback = (
+                "No he podido generar la respuesta con el LLM ahora mismo. "
+                "Aun así, he recuperado fragmentos relevantes arriba que pueden ayudarte. "
+                "Vuelve a intentarlo más tarde."
+            )
+            return ChatResponse(response=fallback, usage={"error": str(ex)})
         answer = raw_resp.choices[0].message.content
         # Adjuntar sección de fuentes con URLs (si existen)
         try:

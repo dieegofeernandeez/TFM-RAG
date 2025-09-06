@@ -12,6 +12,9 @@ logger = logging.getLogger(__name__)
 API_BACKEND_URL = os.getenv("API_BACKEND_URL", "http://localhost:8000")
 USE_RAG = os.getenv("USE_RAG", "true").lower() == "true"
 RAG_TOPK = int(os.getenv("RAG_TOPK", "5"))
+# Controles opcionales desde frontend (por ahora, variables de entorno)
+RAG_EXPAND_NEIGHBORS = os.getenv("RAG_EXPAND_NEIGHBORS", "").strip()
+RAG_NEIGHBOR_RADIUS = os.getenv("RAG_NEIGHBOR_RADIUS", "").strip()
 
 # Configuración de timeouts
 HEALTH_CHECK_TIMEOUT = 10
@@ -85,6 +88,11 @@ class ChatSession:
                     "top_k": RAG_TOPK,
                     "use_llm": True
                 }
+                # Si están definidos en env del frontend, se envían como overrides
+                if RAG_EXPAND_NEIGHBORS:
+                    payload["expand_neighbors"] = (RAG_EXPAND_NEIGHBORS.lower() == "true")
+                if RAG_NEIGHBOR_RADIUS.isdigit():
+                    payload["neighbor_radius"] = int(RAG_NEIGHBOR_RADIUS)
                 logger.info(f"Sending RAG request to {API_BACKEND_URL}/rag")
                 response = requests.post(
                     f"{API_BACKEND_URL}/rag",
