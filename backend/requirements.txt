@@ -1,9 +1,11 @@
-fastapi==0.104.1
-uvicorn==0.24.0
+fastapi==0.110.0
+uvicorn==0.23.2
 groq
 pydantic==2.5.0
 python-multipart==0.0.6
 pymilvus
 pandas
-transformers 
+transformers
 torch
+FlagEmbedding>=1.2.10
+hf_transfer>=0.1.6

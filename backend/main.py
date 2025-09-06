@@ -5,11 +5,13 @@ from groq import Groq
 import os
 from typing import List, Optional
 import logging
+from contextlib import suppress
 
 # --- nuevos imports para RAG
 from transformers import AutoTokenizer, AutoModel
 import torch
 from pymilvus import connections, Collection, utility, FieldSchema, CollectionSchema, DataType
+import math
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -27,29 +29,58 @@ app.add_middleware(
 )
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-# Modelo primario configurable y lista de fallback si no existe / acceso denegado
 PRIMARY_GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-# Lista de modelos vigentes (ajusta según disponibilidad en tu cuenta Groq)
-FALLBACK_MODELS = [
-    PRIMARY_GROQ_MODEL,
-    "llama-3.1-70b-versatile",
-]
+_fallback_raw = os.getenv("GROQ_FALLBACK_MODELS", "")
+FALLBACK_MODELS = [m.strip() for m in _fallback_raw.split(',') if m.strip()] or ["llama-3.1-70b-versatile"]
+GROQ_TEMPERATURE = float(os.getenv("GROQ_TEMPERATURE", "0.2"))
 client = Groq(api_key=GROQ_API_KEY)
+MODEL_CANDIDATES = [PRIMARY_GROQ_MODEL] + [m for m in FALLBACK_MODELS if m != PRIMARY_GROQ_MODEL]
 
 """Modelo de embeddings: carga diferida para reducir RAM inicial.
 Se carga la primera vez que se necesita (retrieve o ingest).
 """
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+EMBED_NORMALIZE = os.getenv("EMBED_NORMALIZE", "false").lower() == "true"
+METRIC_TYPE = os.getenv("METRIC_TYPE", "L2")  # Debe coincidir con el índice creado
+EMBED_MAX_LENGTH = int(os.getenv("EMBED_MAX_LENGTH", "512"))
+IS_BGE_M3 = "bge-m3" in EMBED_MODEL_NAME.lower()
+
+# Re-ranking configurable
+RERANK_ENABLE = os.getenv("RERANK_ENABLE", "true").lower() == "true"
+RERANK_FETCH_MULT = int(os.getenv("RERANK_FETCH_MULT", "3"))  # multiplicador de candidatos iniciales
+RERANK_TITLE_BOOST = float(os.getenv("RERANK_TITLE_BOOST", "0.35"))
+RERANK_SECTION_BOOST = float(os.getenv("RERANK_SECTION_BOOST", "0.15"))
+RERANK_POSITION_DECAY = float(os.getenv("RERANK_POSITION_DECAY", "0.02"))  # penalización leve por posición tardía en texto (si incluyéramos position)
 _tokenizer = None
 _model = None
+_fe_bge_model = None  # FlagEmbedding para BGE-M3
 
 def get_embedding_model():
-    global _tokenizer, _model
-    if _tokenizer is None or _model is None:
-        logger.info(f"Cargando modelo de embeddings (lazy): {EMBED_MODEL_NAME}")
-        _tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_NAME)
-        _model = AutoModel.from_pretrained(EMBED_MODEL_NAME)
-    return _tokenizer, _model
+    """Carga perezosa del modelo de embeddings.
+    - Para BGE-M3 usa FlagEmbedding (mismo que el ingestor)
+    - Para otros, usa Transformers + mean pooling
+    """
+    global _tokenizer, _model, _fe_bge_model
+    if IS_BGE_M3:
+        if _fe_bge_model is None:
+            try:
+                from FlagEmbedding import BGEM3FlagModel  # type: ignore
+            except ImportError as e:
+                logger.error("Falta FlagEmbedding para BGE-M3: pip install FlagEmbedding")
+                raise
+            logger.info("Cargando modelo de embeddings (lazy, FlagEmbedding BGEM3): %s", EMBED_MODEL_NAME)
+            use_fp16 = torch.cuda.is_available()
+            _fe_bge_model = BGEM3FlagModel(EMBED_MODEL_NAME, use_fp16=use_fp16)
+        return None, _fe_bge_model
+    else:
+        if _tokenizer is None or _model is None:
+            logger.info(f"Cargando modelo de embeddings (lazy, Transformers): {EMBED_MODEL_NAME}")
+            _tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_NAME)
+            _model = AutoModel.from_pretrained(EMBED_MODEL_NAME)
+            _model.eval()
+            if torch.cuda.is_available():
+                _model.to("cuda")
+        return _tokenizer, _model
 
 # Función de mean pooling igual que en embedding_generator.py
 
@@ -59,6 +90,32 @@ def _mean_pooling(model_output, attention_mask):
     sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, dim=1)
     sum_mask = torch.clamp(input_mask_expanded.sum(dim=1), min=1e-9)
     return (sum_embeddings / sum_mask)
+
+def encode_query(text: str) -> List[float]:
+    """Codifica la consulta a vector denso list[float] usando el modelo configurado."""
+    if IS_BGE_M3:
+        _, fe_model = get_embedding_model()
+        out = fe_model.encode([text], batch_size=1, max_length=min(EMBED_MAX_LENGTH, 384))
+        vec = out["dense_vecs"][0]
+        import numpy as np
+        v = np.asarray(vec, dtype=np.float32)
+        if EMBED_NORMALIZE:
+            n = float(np.linalg.norm(v))
+            if n > 0.0:
+                v = v / n
+        return v.astype(np.float32).tolist()
+    else:
+        tokenizer, model = get_embedding_model()
+        inputs = tokenizer(text, return_tensors='pt', truncation=True, padding=True, max_length=EMBED_MAX_LENGTH)
+        if torch.cuda.is_available():
+            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = model(**inputs)
+            q_vec = _mean_pooling(outputs, inputs['attention_mask'])
+            if EMBED_NORMALIZE:
+                q_vec = torch.nn.functional.normalize(q_vec, p=2, dim=1)
+            v = q_vec.squeeze().cpu().numpy().astype('float32').tolist()
+        return v
 
 # Conectar a Milvus (host y puerto desde variables de entorno para flexibilidad)
 MILVUS_HOST = os.getenv("MILVUS_HOST", "milvus")
@@ -70,46 +127,44 @@ except Exception as e:
     logger.warning(f"No se pudo conectar a Milvus en inicio: {e}")
 
 def ensure_text_embeddings_collection(dim: int = 384) -> Collection:
-    """Ensure the 'text_embeddings' collection exists in Milvus. If not, create it with a basic schema and an IVF_FLAT index.
-    Returns the Collection instance (loaded) or raises an exception on failure.
-    """
+    """Asegura la colección con esquema extendido (text + metadatos)."""
     try:
-        # reconectar si hace falta
         try:
             connections.connect("default")
         except Exception:
             pass
-
-        if not utility.has_collection("text_embeddings"):
-            logger.info("Colección 'text_embeddings' no existe. Creando...")
+        name = "text_embeddings"
+        if not utility.has_collection(name):
+            logger.info("Colección 'text_embeddings' no existe. Creando (extendida)...")
             fields = [
                 FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
                 FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=dim),
-                FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=500)
+                FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=1000),
+                FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=200),
+                FieldSchema(name="category", dtype=DataType.VARCHAR, max_length=80),
+                FieldSchema(name="section", dtype=DataType.VARCHAR, max_length=120),
+                FieldSchema(name="source_type", dtype=DataType.VARCHAR, max_length=32),
+                FieldSchema(name="url", dtype=DataType.VARCHAR, max_length=400),
             ]
-            schema = CollectionSchema(fields, description="Colección de embeddings de texto")
-            col = Collection("text_embeddings", schema=schema)
-
-            # Crear índice vectorial
+            schema = CollectionSchema(fields, description="Embeddings con metadatos unificados")
+            col = Collection(name, schema=schema)
             try:
-                index_params = {"index_type": "IVF_FLAT", "metric_type": "L2", "params": {"nlist": 1024}}
+                index_params = {"index_type": "IVF_FLAT", "metric_type": METRIC_TYPE, "params": {"nlist": 1024}}
                 col.create_index(field_name="embedding", index_params=index_params)
-                logger.info("Índice creado para 'text_embeddings'")
             except Exception as e:
-                logger.warning(f"No se pudo crear índice (puede ser tolerable): {e}")
-
+                logger.warning(f"No se pudo crear índice inicial: {e}")
             col.load()
-            logger.info("Colección 'text_embeddings' creada y cargada.")
             return col
-        else:
-            col = Collection("text_embeddings")
-            # Intentar cargar si no está cargada
-            try:
-                col.load()
-            except Exception:
-                pass
-            return col
-
+        col = Collection(name)
+        try:
+            col.load()
+        except Exception:
+            pass
+        existing = {f.name for f in col.schema.fields}
+        expected = {"text", "title", "category", "section", "source_type", "url"}
+        if not expected.issubset(existing):
+            logger.warning("Colección existente sin todos los campos extendidos (%s). Reingesta recomendada.", expected - existing)
+        return col
     except Exception as e:
         logger.error(f"Fallo asegurando colección text_embeddings: {e}")
         raise
@@ -136,9 +191,18 @@ class RagRequest(BaseModel):
     use_llm: Optional[bool] = True
     model: Optional[str] = PRIMARY_GROQ_MODEL
 
+class RetrievedContext(BaseModel):
+    text: str
+    title: Optional[str] = None
+    category: Optional[str] = None
+    section: Optional[str] = None
+    source_type: Optional[str] = None
+    distance: float
+    score: float
+    url: Optional[str] = None
+
 class RagRetrieveResponse(BaseModel):
-    contexts: List[str]
-    distances: List[float]
+    contexts: List[RetrievedContext]
 
 class IngestRequest(BaseModel):
     texts: List[str]
@@ -149,40 +213,82 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "groq-llama-3.1"}
-
-def _call_groq_chat(model: str, messages: List[dict], temperature: float, max_tokens: int):
-    """Intenta llamar al modelo especificado y aplica fallback si el modelo no existe o está deprecado.
-    Devuelve (resp, modelo_utilizado) o lanza excepción final.
-    """
-    tried_errors = []
-    candidate_models = [model] + [m for m in FALLBACK_MODELS if m != model]
-    for m in candidate_models:
+    """Health extendido: muestra modelos y estado de Milvus/colección."""
+    info = {"status": "healthy", "service": "api-backend"}
+    info["llm_primary"] = PRIMARY_GROQ_MODEL
+    info["llm_fallbacks"] = FALLBACK_MODELS
+    info["embed_model"] = EMBED_MODEL_NAME
+    info["embed_normalize"] = EMBED_NORMALIZE
+    info["metric_type"] = METRIC_TYPE
+    # Milvus / colección
+    try:
         try:
-            logger.info(f"Llamando Groq model={m}")
+            connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
+        except Exception:
+            pass
+        info["milvus_host"] = MILVUS_HOST
+        info["milvus_port"] = MILVUS_PORT
+        exists = utility.has_collection("text_embeddings")
+        info["collection_exists"] = exists
+        if exists:
+            with suppress(Exception):
+                col = Collection("text_embeddings")
+                with suppress(Exception):
+                    info["num_entities"] = col.num_entities
+                with suppress(Exception):
+                    # primera dimensión del campo embedding
+                    emb_field = next(f for f in col.schema.fields if f.name == "embedding")
+                    info["collection_dim"] = emb_field.params.get("dim")
+    except Exception as e:
+        info["milvus_error"] = str(e)
+    return info
+
+def call_groq_with_fallback(messages: List[dict], max_tokens: int, temperature: float | None = None, primary: str | None = None):
+    """Itera modelos (primario + fallbacks) hasta obtener respuesta válida."""
+    temp = temperature if temperature is not None else GROQ_TEMPERATURE
+    ordered = [primary] if primary else []
+    ordered += [m for m in MODEL_CANDIDATES if m and m not in ordered]
+    errors = []
+    for m in ordered:
+        try:
+            logger.info(f"Groq→ intentando modelo='{m}'")
             resp = client.chat.completions.create(
                 model=m,
                 messages=messages,
-                temperature=temperature,
+                temperature=temp,
                 max_tokens=max_tokens
             )
-            if m != model:
-                logger.warning(f"Se usó modelo fallback '{m}' (solicitado '{model}').")
+            if m != (primary or PRIMARY_GROQ_MODEL):
+                logger.warning(f"Usado fallback '{m}'")
             return resp, m
         except Exception as ex:
-            err_txt = str(ex)
-            tried_errors.append((m, err_txt))
-            lower_err = err_txt.lower()
-            # Patrones de errores tolerables para intentar siguiente modelo
-            if any(pat in lower_err for pat in ["model_not_found", "does not exist", "decommissioned", "model_decommissioned", "invalid_request_error"]):
-                logger.warning(f"Modelo {m} no disponible/deprecado ({err_txt}). Probando siguiente...")
+            msg = str(ex)
+            lower = msg.lower()
+            errors.append(f"{m}:{msg}")
+            if any(p in lower for p in ["model_not_found", "does not exist", "decommissioned", "model_decommissioned", "invalid_request_error"]):
+                logger.warning(f"Modelo {m} no disponible ({msg}). Siguiente...")
                 continue
-            # Errores no recuperables (auth, rate limit, etc.) se relanzan
-            logger.error(f"Error no recuperable con modelo {m}: {err_txt}")
+            # Errores no recuperables
+            logger.error(f"Error no recuperable con {m}: {msg}")
             raise
-    # Si todos fallan con errores de 'modelo no disponible'
-    summary = "; ".join([f"{m}:{e}" for m, e in tried_errors])
-    raise HTTPException(status_code=400, detail=f"Ningún modelo disponible. Errores: {summary}")
+    raise HTTPException(status_code=400, detail="; ".join(errors) or "No modelos válidos")
+
+def _usage_to_dict(raw_resp, used_model: str) -> dict:
+    """Best-effort conversion of Groq usage payload to plain dict without Pydantic v2 deprecation warnings."""
+    try:
+        usage = getattr(raw_resp, "usage", None)
+        if usage is None:
+            return {"model": used_model}
+        # Prefer Pydantic v2 API
+        if hasattr(usage, "model_dump"):
+            return usage.model_dump()
+        # Fallback to v1 API if present
+        if hasattr(usage, "dict"):
+            return usage.dict()
+        # As a last resort, stringify
+        return {"model": used_model, "raw": str(usage)}
+    except Exception:
+        return {"model": used_model}
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
@@ -190,15 +296,15 @@ async def chat(request: ChatRequest):
         groq_messages = [
             {"role": m.role, "content": m.content} for m in request.messages
         ]
-        raw_resp, used_model = _call_groq_chat(
-            model=request.model or PRIMARY_GROQ_MODEL,
-            messages=groq_messages,
+        raw_resp, used_model = call_groq_with_fallback(
+            groq_messages,
+            max_tokens=request.max_tokens,
             temperature=request.temperature,
-            max_tokens=request.max_tokens
+            primary=request.model or PRIMARY_GROQ_MODEL
         )
         return ChatResponse(
             response=raw_resp.choices[0].message.content,
-            usage=raw_resp.usage.dict() if hasattr(raw_resp, "usage") else {"model": used_model}
+            usage=_usage_to_dict(raw_resp, used_model)
         )
     except Exception as e:
         logger.error(f"Groq API error: {e}")
@@ -208,42 +314,90 @@ async def chat(request: ChatRequest):
 @app.post("/rag/retrieve", response_model=RagRetrieveResponse)
 async def rag_retrieve(request: RagRequest):
     try:
-        question = request.question
+        question = request.question.strip()
+        if not question:
+            raise HTTPException(status_code=400, detail="Pregunta vacía")
         top_k = request.top_k or 5
-
-        # Asegurar conexión a Milvus
         try:
             connections.connect("default")
         except Exception:
             pass
+    col = ensure_text_embeddings_collection(dim=1024 if IS_BGE_M3 else 384)
+        q_emb = encode_query(question)
 
-        # Asegurar que la colección existe (se crea si falta)
-        col = ensure_text_embeddings_collection(dim=384)
+        fetch_limit = top_k * RERANK_FETCH_MULT if RERANK_ENABLE else top_k
+        search_params = {"metric_type": METRIC_TYPE, "params": {"nprobe": 10}}
+        # Determinar output_fields disponibles (compatibilidad con colecciones antiguas sin 'url')
+        available_fields = {f.name for f in col.schema.fields}
+        wanted_fields = ["text", "title", "category", "section", "source_type"]
+        if "url" in available_fields:
+            wanted_fields.append("url")
 
-        # Calcular embedding de la pregunta (carga lazy)
-        tokenizer, model = get_embedding_model()
-        inputs = tokenizer(question, return_tensors='pt', truncation=True, padding=True, max_length=512)
-        with torch.no_grad():
-            outputs = model(**inputs)
-            q_emb = _mean_pooling(outputs, inputs['attention_mask']).squeeze().cpu().numpy().tolist()
-
-        search_params = {"metric_type": "L2", "params": {"nprobe": 10}}
         results = col.search(
             data=[q_emb],
             anns_field="embedding",
             param=search_params,
-            limit=top_k,
-            output_fields=["text"]
+            limit=fetch_limit,
+            output_fields=wanted_fields
         )
 
-        contexts = []
-        distances = []
+        raw = []
         for r in results[0]:
-            contexts.append(r.entity.get("text"))
-            distances.append(r.distance)
-        logger.info(f"RAG retrieve: devueltos {len(contexts)}/{top_k} contextos")
-        return RagRetrieveResponse(contexts=contexts, distances=distances)
+            ent = r.entity
+            item = {
+                "text": ent.get("text"),
+                "title": ent.get("title") or "",
+                "category": ent.get("category") or "",
+                "section": ent.get("section") or "",
+                "source_type": ent.get("source_type") or "",
+                "distance": r.distance
+            }
+            if "url" in available_fields:
+                item["url"] = ent.get("url") or ""
+            raw.append(item)
 
+        # Re-ranking ligero
+        if RERANK_ENABLE and raw:
+            q_terms = [t for t in question.lower().split() if len(t) > 2]
+            def term_match_score(text: str, terms: List[str]) -> float:
+                lt = text.lower()
+                hits = sum(1 for t in terms if t in lt)
+                return hits / max(1, len(terms))
+            reranked = []
+            for item in raw:
+                base_sim = item['distance'] if METRIC_TYPE.upper() == 'IP' else -item['distance']
+                title_bonus = term_match_score(item['title'], q_terms) * RERANK_TITLE_BOOST
+                section_bonus = term_match_score(item['section'], q_terms) * RERANK_SECTION_BOOST
+                length_penalty = 0.0
+                l = len(item['text']) if item['text'] else 0
+                if l > 950:
+                    length_penalty = 0.05
+                score = base_sim + title_bonus + section_bonus - length_penalty
+                item['score'] = score
+                reranked.append(item)
+            reranked.sort(key=lambda x: x['score'], reverse=True)
+            selected = reranked[:top_k]
+        else:
+            for item in raw:
+                item['score'] = item['distance'] if METRIC_TYPE.upper() == 'IP' else -item['distance']
+            selected = raw[:top_k]
+
+        contexts: List[RetrievedContext] = [
+            RetrievedContext(
+                text=i['text'],
+                title=i['title'],
+                category=i['category'],
+                section=i['section'],
+                source_type=i['source_type'],
+                distance=i['distance'],
+                score=i['score'],
+                url=i.get('url') or None
+            ) for i in selected
+        ]
+        logger.info(f"RAG retrieve: candidatos={len(raw)} devueltos={len(contexts)} rerank={'on' if RERANK_ENABLE else 'off'}")
+        return RagRetrieveResponse(contexts=contexts)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"RAG retrieve error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -255,28 +409,41 @@ async def rag(request: RagRequest):
         # Recuperar contextos
         retrieve_req = RagRequest(question=request.question, top_k=request.top_k)
         retrieve_res = await rag_retrieve(retrieve_req)
-
-        # Construir prompt con contextos
-        context_text = "\n\n--- Contextos relevantes (extraídos del corpus) ---\n\n"
+        context_text = "\n\n--- Contextos relevantes (cita siempre las fuentes con su URL) ---\n\n"
         for i, c in enumerate(retrieve_res.contexts):
-            context_text += f"[{i+1}] {c}\n\n"
+            source_url = f" | URL: {c.url}" if c.url else ""
+            meta = f"{c.title or 'Sin título'} ({c.category or '-' } > {c.section or '-'}) [{c.source_type or '-'}]{source_url} dist={c.distance:.4f} score={c.score:.4f}"
+            context_text += f"[{i+1}] {meta}\n{c.text}\n\n"
 
-        system_message = {"role": "system", "content": "Utiliza los siguientes fragmentos de contexto para responder de forma concisa y precisa a la pregunta del usuario. Si la respuesta no está en los contextos, responde indicando que no se encontró información relevante."}
-        # Mensajes: primero contexto como system + luego user question
+        system_message = {"role": "system", "content": (
+            "Eres un asistente que contesta de forma breve y precisa, y siempre cita las fuentes. "
+            "Responde solo con información presente en los contextos. "
+            "Incluye una sección 'Fuentes' al final con las URLs de los fragmentos utilizados. "
+            "Si no hay información suficiente, dilo claramente."
+        )}
         messages = [system_message, {"role": "user", "content": context_text + "\nPregunta: " + request.question}]
 
-        # Llamar a Groq para generar respuesta
-        raw_resp, used_model = _call_groq_chat(
-            model=request.model or PRIMARY_GROQ_MODEL,
-            messages=messages,
+        raw_resp, used_model = call_groq_with_fallback(
+            messages,
+            max_tokens=800,
             temperature=0.0,
-            max_tokens=800
+            primary=request.model or PRIMARY_GROQ_MODEL
         )
-        return ChatResponse(
-            response=raw_resp.choices[0].message.content,
-            usage=raw_resp.usage.dict() if hasattr(raw_resp, "usage") else {"model": used_model}
-        )
-
+        answer = raw_resp.choices[0].message.content
+        # Adjuntar sección de fuentes con URLs (si existen)
+        try:
+            unique_sources = []
+            seen = set()
+            for c in retrieve_res.contexts:
+                if c.url and c.url not in seen:
+                    title = c.title or "Fuente"
+                    unique_sources.append(f"- {title}: {c.url}")
+                    seen.add(c.url)
+            if unique_sources:
+                answer = answer.rstrip() + "\n\nFuentes:\n" + "\n".join(unique_sources)
+        except Exception:
+            pass
+        return ChatResponse(response=answer, usage=_usage_to_dict(raw_resp, used_model))
     except Exception as e:
         logger.error(f"RAG error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -328,9 +495,9 @@ async def chat_stream(request: ChatRequest):
         ]
         
         response = client.chat.completions.create(
-            model=request.model,
+            model=request.model or PRIMARY_GROQ_MODEL,
             messages=Llama_messages,
-            temperature=request.temperature,
+            temperature=request.temperature if request.temperature is not None else GROQ_TEMPERATURE,
             max_tokens=request.max_tokens,
             stream=True
         )

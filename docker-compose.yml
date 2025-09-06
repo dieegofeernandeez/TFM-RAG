@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # Servicio API Backend con Groq
   api-backend:
@@ -13,13 +11,18 @@ services:
       - PORT=8000
       - MILVUS_HOST=milvus
       - MILVUS_PORT=19530
-      - EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
-      # Coloca tu clave real (o usa variable externa)
+      - EMBED_MODEL=BAAI/bge-m3
+      - EMBED_NORMALIZE=true
+      - METRIC_TYPE=IP
       - GROQ_API_KEY=
-      - EMBED_CSV=/data/wiki_scraped.csv
+      - EMBED_COLLECTION=text_embeddings
+  # Cache HF para no volver a descargar el modelo grande en cada build/run
+      - HF_HOME=/root/.cache/huggingface
+      - HF_HUB_ENABLE_HF_TRANSFER=1
     volumes:
       - ./backend:/app
       - ./data:/data:ro
+      - ./hf-cache:/root/.cache/huggingface
     depends_on:
       - milvus
       - minio
@@ -45,6 +48,37 @@ services:
     depends_on:
       - api-backend
     restart: unless-stopped
+    networks:
+      - chat-network
+
+  # Servicio opcional para ejecutar la ingesta (se puede lanzar y detener una vez termine)
+  embedding-ingest:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: embedding-ingest
+    command: python embedding_generator.py
+    environment:
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - EMBED_MODEL=BAAI/bge-m3
+      - EMBED_NORMALIZE=true
+      - METRIC_TYPE=IP
+      - EMBED_COLLECTION=text_embeddings
+      - EMBED_JSONL=/data/prepared_corpus.jsonl
+      - FORCE_REINGEST=true
+      - EMBED_BATCH=64
+      - HF_HOME=/root/.cache/huggingface
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+    volumes:
+      - ./backend:/app
+      - ./data:/data:ro
+      - ./hf-cache:/root/.cache/huggingface
+    depends_on:
+      - milvus
+      - minio
+      - etcd
+    restart: "no"
     networks:
       - chat-network
 
