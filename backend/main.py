@@ -8,12 +8,12 @@ import logging
 from contextlib import suppress
 import unicodedata
 import re
+import json
 
 # --- nuevos imports para RAG
 from transformers import AutoTokenizer, AutoModel
 import torch
 from pymilvus import connections, Collection, utility, FieldSchema, CollectionSchema, DataType
-import math
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -41,7 +41,7 @@ MODEL_CANDIDATES = [PRIMARY_GROQ_MODEL] + [m for m in FALLBACK_MODELS if m != PR
 """Modelo de embeddings: carga diferida para reducir RAM inicial.
 Se carga la primera vez que se necesita (retrieve o ingest).
 """
-EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
 EMBED_NORMALIZE = os.getenv("EMBED_NORMALIZE", "false").lower() == "true"
 METRIC_TYPE = os.getenv("METRIC_TYPE", "L2")  # Debe coincidir con el índice creado
 EMBED_MAX_LENGTH = int(os.getenv("EMBED_MAX_LENGTH", "512"))
@@ -164,7 +164,7 @@ def jaccard_set(a: Set[str], b: Set[str]) -> float:
         return 0.0
     return inter / union
 
-def ensure_text_embeddings_collection(dim: int = 384) -> Collection:
+def ensure_text_embeddings_collection(dim: int = 1024) -> Collection:
     """Asegura la colección con esquema extendido (text + metadatos), índice y carga en memoria.
 
     - Evita llamar load() antes de crear el índice (para no disparar "index doesn't exist").
@@ -246,6 +246,60 @@ def ensure_text_embeddings_collection(dim: int = 384) -> Collection:
         logger.error(f"Fallo asegurando colección text_embeddings: {e}")
         raise
 
+# Fallback: buscar URLs por título en el JSONL preparado cuando los contextos no traen url
+def _looks_like_url(val: Optional[str]) -> bool:
+    if not val:
+        return False
+    v = val.strip().lower()
+    return v.startswith("http://") or v.startswith("https://")
+
+def find_urls_by_titles(titles: List[str]) -> List[str]:
+    path = os.getenv("EMBED_JSONL", "/data/prepared_corpus.jsonl")
+    titles_norm = {t.strip().lower() for t in titles if t}
+    if not titles_norm:
+        return []
+    urls: list[str] = []
+    seen = set()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line[0] != "{":
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                title = str(row.get("title", "") or "").strip()
+                if title.lower() not in titles_norm:
+                    continue
+                url = str(row.get("url", "") or "").strip()
+                if not _looks_like_url(url):
+                    continue
+                st = str(row.get("source_type", "") or "").lower()
+                # priorizar wiki/web; aceptar cualquier http en ausencia de otros
+                priority = 0
+                if st in {"wiki", "web"}:
+                    priority = -1
+                key = (priority, url)
+                if url in seen:
+                    continue
+                seen.add(url)
+                urls.append(url)
+                # no rompemos por si hay varias coincidencias; se deduplican por 'seen'
+    except Exception as e:
+        logger.warning(f"No se pudo escanear JSONL para URLs por título: {e}")
+    return urls
+
+# Utilidad: eliminar marcadores tipo [1] [23] del texto (p. ej., notas o citas)
+_BRACKET_NUM_RE = re.compile(r"(?:\s*\[\d{1,3}\])+")
+
+def strip_numeric_brackets(text: str) -> str:
+    try:
+        return _BRACKET_NUM_RE.sub("", text)
+    except Exception:
+        return text
+
 # Modelos Pydantic
 class Message(BaseModel):
     role: str
@@ -280,6 +334,8 @@ class RetrievedContext(BaseModel):
     distance: float
     score: float
     url: Optional[str] = None
+    doc_id: Optional[str] = None
+    position: Optional[int] = None
 
 class RagRetrieveResponse(BaseModel):
     contexts: List[RetrievedContext]
@@ -604,7 +660,9 @@ async def rag_retrieve(request: RagRequest):
             source_type=i['source_type'],
             distance=i['distance'],
             score=i['score'],
-            url=i.get('url') or None
+            url=i.get('url') or None,
+            doc_id=i.get('doc_id') or None,
+            position=i.get('position') if isinstance(i.get('position'), int) else None
         ) for i in selected
     ]
     logger.info(f"RAG retrieve: candidatos={len(raw)} devueltos={len(contexts)} rerank={'on' if RERANK_ENABLE else 'off'}")
@@ -630,18 +688,18 @@ async def rag(request: RagRequest):
                 "Intenta de nuevo en unos minutos."
             )
             return ChatResponse(response=msg, usage={"model": request.model or PRIMARY_GROQ_MODEL, "note": "no_contexts"})
-        context_text = "\n\n--- Contextos relevantes (cita siempre las fuentes con su URL) ---\n\n"
+        context_text = "\n\n--- Contextos relevantes (usa solo estos contenidos; no incluyas referencias numéricas) ---\n\n"
         for i, c in enumerate(retrieve_res.contexts):
-            source_url = f" | URL: {c.url}" if c.url else ""
-            meta = f"{c.title or 'Sin título'} ({c.category or '-' } > {c.section or '-'}) [{c.source_type or '-'}]{source_url} dist={c.distance:.4f} score={c.score:.4f}"
-            context_text += f"[{i+1}] {meta}\n{c.text}\n\n"
+            url_part = f" URL: {c.url}" if c.url else ""
+            meta = f"{c.title or 'Sin título'} ({c.category or '-' } > {c.section or '-'}) [{c.source_type or '-'}]{url_part}"
+            clean_text = strip_numeric_brackets(c.text or "")
+            context_text += f"- {meta}\n{clean_text}\n\n"
 
         system_message = {"role": "system", "content": (
-            "Eres un asistente que responde de forma clara, completa y bien estructurada, y siempre cita las fuentes. "
-            "Responde solo con información presente en los contextos. "
-            "Estructura la respuesta con secciones y listas cuando ayude a la comprensión. "
-            "Incluye una sección 'Fuentes' al final con las URLs de los fragmentos utilizados. "
-            "Si no hay información suficiente, dilo claramente."
+            "Eres un asistente que responde de forma clara, completa y bien estructurada. "
+            "Responde únicamente con la información presente en los contextos. "
+            "No incluyas referencias numéricas como [1], [2], etc. "
+            "No inventes enlaces ni fuentes. Si no hay suficiente información en los contextos, indícalo."
         )}
         messages = [system_message, {"role": "user", "content": context_text + "\nPregunta: " + request.question}]
 
@@ -660,18 +718,37 @@ async def rag(request: RagRequest):
                 "Vuelve a intentarlo más tarde."
             )
             return ChatResponse(response=fallback, usage={"error": str(ex)})
-        answer = raw_resp.choices[0].message.content
-        # Adjuntar sección de fuentes con URLs (si existen)
+        answer = strip_numeric_brackets(raw_resp.choices[0].message.content or "")
+        # Adjuntar sección de fuentes numeradas [n] -> URL
         try:
-            unique_sources = []
+            numbered: list[tuple[int, str]] = []
             seen = set()
-            for c in retrieve_res.contexts:
-                if c.url and c.url not in seen:
-                    title = c.title or "Fuente"
-                    unique_sources.append(f"- {title}: {c.url}")
-                    seen.add(c.url)
-            if unique_sources:
-                answer = answer.rstrip() + "\n\nFuentes:\n" + "\n".join(unique_sources)
+            titles_for_fallback: list[str] = []
+            for idx, c in enumerate(retrieve_res.contexts, start=1):
+                candidate = c.url if c.url else None
+                with suppress(Exception):
+                    did = getattr(c, "__dict__", {}).get("doc_id") or None  # type: ignore
+                    if not candidate and _looks_like_url(did):
+                        candidate = did
+                if not _looks_like_url(candidate):
+                    titles_for_fallback.append(c.title or "")
+                else:
+                    key = (idx, candidate)
+                    if key not in seen:
+                        seen.add(key)
+                        numbered.append((idx, candidate))
+            # Si aún no hay URLs, intentar resolver por título en el JSONL preparado
+            if not numbered and titles_for_fallback:
+                resolved = find_urls_by_titles(titles_for_fallback)
+                for i, u in enumerate(resolved, start=1):
+                    if _looks_like_url(u):
+                        k = (i, u)
+                        if k not in seen:
+                            seen.add(k)
+                            numbered.append((i, u))
+            if numbered:
+                lines = [f"[{i}] {u}" for i, u in numbered]
+                answer = answer.rstrip() + "\n\nFuentes:\n" + "\n".join(lines)
         except Exception:
             pass
         return ChatResponse(response=answer, usage=_usage_to_dict(raw_resp, used_model))
@@ -679,42 +756,7 @@ async def rag(request: RagRequest):
         logger.error(f"RAG error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/rag/ingest")
-async def rag_ingest(req: IngestRequest):
-    """Ingesta una lista de textos en la colección 'text_embeddings'.
-    Trunca cada texto a 500 caracteres (schema VARCHAR(500)).
-    """
-    try:
-        if not req.texts:
-            raise HTTPException(status_code=400, detail="Lista 'texts' vacía")
-        try:
-            connections.connect("default")
-        except Exception:
-            pass
-        col = ensure_text_embeddings_collection(dim=384)
-        tokenizer, model = get_embedding_model()
-        embeddings = []
-        stored_texts = []
-        for t in req.texts:
-            if not t or not t.strip():
-                continue
-            inputs = tokenizer(t, return_tensors='pt', truncation=True, padding=True, max_length=512)
-            with torch.no_grad():
-                outputs = model(**inputs)
-                emb = _mean_pooling(outputs, inputs['attention_mask']).squeeze().cpu().numpy().tolist()
-            embeddings.append(emb)
-            stored_texts.append(t[:500])
-        if not embeddings:
-            raise HTTPException(status_code=400, detail="No se generaron embeddings válidos")
-        # Insertar (id auto por schema)
-        col.insert([embeddings, stored_texts])
-        col.flush()
-        return {"inserted": len(embeddings)}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Ingest error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+# Nota: Se eliminó el endpoint /rag/ingest legacy para evitar confusiones.
 
 @app.post("/chat/stream")
 async def chat_stream(request: ChatRequest):
@@ -746,11 +788,6 @@ async def chat_stream(request: ChatRequest):
         logger.error(f"Error in streaming chat: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error in streaming: {str(e)}")
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
-
 # Endpoint de diagnóstico para revisar estado del RAG
 @app.get("/rag/status")
 async def rag_status():
@@ -779,3 +816,8 @@ async def rag_status():
         return info
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)

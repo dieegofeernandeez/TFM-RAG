@@ -42,7 +42,7 @@ def validate_api_response(response: requests.Response) -> Dict:
 def check_api_health() -> bool:
     """Verificar que el API esté disponible (Groq Llama 3.1)"""
     try:
-        logger.info("Verificando estado del API Groq Llama 3.1...")
+        logger.info("Verificando estado del API de chat...")
         response = requests.get(
             f"{API_BACKEND_URL}/health", 
             timeout=HEALTH_CHECK_TIMEOUT
@@ -50,7 +50,7 @@ def check_api_health() -> bool:
         if response.status_code == 200:
             data = validate_api_response(response)
             if "error" not in data:
-                logger.info("API Groq Llama 3.1 disponible")
+                logger.info("API de chat disponible")
                 return True
             else:
                 logger.warning(f"API respondió con error: {data.get('error')}")

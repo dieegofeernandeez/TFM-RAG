@@ -11,7 +11,9 @@ services:
       - PORT=8000
       - MILVUS_HOST=milvus
       - MILVUS_PORT=19530
-      - EMBED_MODEL=BAAI/bge-m3
+      - EMBED_MODEL=${EMBED_MODEL}
+      - GROQ_MODEL=${GROQ_MODEL}
+      - GROQ_FALLBACK_MODELS=${GROQ_FALLBACK_MODELS}
       - EMBED_NORMALIZE=true
       - METRIC_TYPE=IP
   # RAG tuning
@@ -23,9 +25,9 @@ services:
       - RAG_MAX_TOKENS=1400
       - EXPAND_NEIGHBORS=true
       - NEIGHBOR_RADIUS=2
-      - GROQ_API_KEY=
+      - GROQ_API_KEY=${GROQ_API_KEY}
       - EMBED_COLLECTION=text_embeddings
-  # Cache HF para no volver a descargar el modelo grande en cada build/run
+      # Cache HF para no volver a descargar el modelo grande en cada build/run
       - HF_HOME=/root/.cache/huggingface
       - HF_HUB_ENABLE_HF_TRANSFER=1
     volumes:
@@ -66,16 +68,17 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: embedding-ingest
+    profiles: ["ingest"]
     command: python embedding_generator.py
     environment:
       - MILVUS_HOST=milvus
       - MILVUS_PORT=19530
-      - EMBED_MODEL=BAAI/bge-m3
+      - EMBED_MODEL=${EMBED_MODEL}
       - EMBED_NORMALIZE=true
       - METRIC_TYPE=IP
       - EMBED_COLLECTION=text_embeddings
       - EMBED_JSONL=/data/prepared_corpus.jsonl
-      - FORCE_REINGEST=true
+      - FORCE_REINGEST=false
       - EMBED_BATCH=64
       - HF_HOME=/root/.cache/huggingface
       - HF_HUB_ENABLE_HF_TRANSFER=1
